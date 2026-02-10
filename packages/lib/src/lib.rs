@@ -337,7 +337,10 @@ impl<T: ?Sized + 'static> Client<T> {
     }
 
     /// Spawn a reader task wired to our Arc<ClientInner>.
-    fn start_reader(inner: &Arc<ClientInner>, reader: tokio::io::ReadHalf<TcpStream>) -> ReaderHandle {
+    fn start_reader(
+        inner: &Arc<ClientInner>,
+        reader: tokio::io::ReadHalf<TcpStream>,
+    ) -> ReaderHandle {
         let inner_clone = Arc::clone(inner);
         ReaderHandle(tokio::spawn(async move {
             if let Err(e) = Self::read_responses(inner_clone, reader).await {
@@ -481,8 +484,7 @@ impl<T: ?Sized + 'static> Client<T> {
 
             match rx.await {
                 Ok(response_payload) => {
-                    let response: Result<Resp, String> =
-                        postcard::from_bytes(&response_payload)?;
+                    let response: Result<Resp, String> = postcard::from_bytes(&response_payload)?;
                     return response.map_err(|e| anyhow!("{e}"));
                 }
                 Err(_) => {
@@ -568,7 +570,9 @@ impl<T: ?Sized + 'static> Client<T> {
                     if self.reconnect().await.is_ok() {
                         continue;
                     }
-                    eprintln!("RPC stream call failed: reconnect unsuccessful on attempt {attempt}");
+                    eprintln!(
+                        "RPC stream call failed: reconnect unsuccessful on attempt {attempt}"
+                    );
                 } else {
                     eprintln!("RPC stream call failed after {attempt} attempts: {e}");
                 }
@@ -633,7 +637,10 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         service: Arc<T>,
         dispatch: DispatchFn<T>,
     ) -> Result<()> {
-        let peer = stream.peer_addr().map(|p| p.to_string()).unwrap_or_else(|_| "unknown".into());
+        let peer = stream
+            .peer_addr()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| "unknown".into());
         let (mut reader, writer) = tokio::io::split(stream);
         let writer = Arc::new(Mutex::new(writer));
 
@@ -661,37 +668,41 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
 
             match frame_type {
                 FrameType::Request => {
-                    let dispatch_result = dispatch(&service, method_id, &payload).await;
+                    let service = Arc::clone(&service);
                     let writer = Arc::clone(&writer);
 
-                    match dispatch_result {
-                        DispatchResult::Unary(response_payload) => {
-                            // Send unary response
-                            let response_header = encode_stream_header(
-                                FrameType::Response,
-                                method_id,
-                                request_id,
-                                response_payload.len() as u32,
-                            );
+                    // Spawn each request so long-running handlers don't block
+                    // subsequent requests (e.g. health-check pings) on the same connection.
+                    tokio::spawn(async move {
+                        let dispatch_result = dispatch(&service, method_id, &payload).await;
 
-                            let mut response =
-                                Vec::with_capacity(STREAM_HEADER_SIZE + response_payload.len());
-                            response.extend_from_slice(&response_header);
-                            response.extend_from_slice(&response_payload);
+                        match dispatch_result {
+                            DispatchResult::Unary(response_payload) => {
+                                // Send unary response
+                                let response_header = encode_stream_header(
+                                    FrameType::Response,
+                                    method_id,
+                                    request_id,
+                                    response_payload.len() as u32,
+                                );
 
-                            writer.lock().await.write_all(&response).await?;
-                        }
-                        DispatchResult::Stream(stream) => {
-                            // Spawn task to send stream items
-                            tokio::spawn(async move {
+                                let mut response =
+                                    Vec::with_capacity(STREAM_HEADER_SIZE + response_payload.len());
+                                response.extend_from_slice(&response_header);
+                                response.extend_from_slice(&response_payload);
+
+                                if let Err(e) = writer.lock().await.write_all(&response).await {
+                                    eprintln!(
+                                        "Failed to write response for request {request_id}: {e}"
+                                    );
+                                }
+                            }
+                            DispatchResult::Stream(mut stream) => {
                                 use std::future::poll_fn;
                                 use std::pin::Pin;
 
-                                let mut stream = stream;
-
                                 loop {
                                     let item = poll_fn(|cx| {
-                                        // SAFETY: The stream is boxed and we never move it
                                         let pinned = unsafe { Pin::new_unchecked(&mut *stream) };
                                         pinned.poll_next_bytes(cx)
                                     })
@@ -712,18 +723,14 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                             message.extend_from_slice(&header);
                                             message.extend_from_slice(&item_bytes);
 
-                                            if let Err(e) = writer
-                                                .lock()
-                                                .await
-                                                .write_all(&message)
-                                                .await
+                                            if let Err(e) =
+                                                writer.lock().await.write_all(&message).await
                                             {
                                                 eprintln!("Server stream write failed for request {request_id}: {e}");
                                                 break;
                                             }
                                         }
                                         Some(Err(e)) => {
-                                            // Send error and end stream
                                             let error_bytes =
                                                 postcard::to_allocvec(&e).unwrap_or_default();
                                             let header = encode_stream_header(
@@ -743,7 +750,6 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                             break;
                                         }
                                         None => {
-                                            // Stream ended - send StreamEnd
                                             let header = encode_stream_header(
                                                 FrameType::StreamEnd,
                                                 method_id,
@@ -756,27 +762,32 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                         }
                                     }
                                 }
-                            });
-                        }
-                        DispatchResult::Error(e) => {
-                            // Send error as unary response
-                            let response_payload =
-                                postcard::to_allocvec(&Err::<(), _>(e.to_string()))?;
-                            let response_header = encode_stream_header(
-                                FrameType::Response,
-                                method_id,
-                                request_id,
-                                response_payload.len() as u32,
-                            );
+                            }
+                            DispatchResult::Error(e) => {
+                                // Send error as unary response
+                                let Ok(response_payload) =
+                                    postcard::to_allocvec(&Err::<(), _>(e.to_string()))
+                                else {
+                                    return;
+                                };
+                                let response_header = encode_stream_header(
+                                    FrameType::Response,
+                                    method_id,
+                                    request_id,
+                                    response_payload.len() as u32,
+                                );
 
-                            let mut response =
-                                Vec::with_capacity(STREAM_HEADER_SIZE + response_payload.len());
-                            response.extend_from_slice(&response_header);
-                            response.extend_from_slice(&response_payload);
+                                let mut response =
+                                    Vec::with_capacity(STREAM_HEADER_SIZE + response_payload.len());
+                                response.extend_from_slice(&response_header);
+                                response.extend_from_slice(&response_payload);
 
-                            writer.lock().await.write_all(&response).await?;
+                                if let Err(e) = writer.lock().await.write_all(&response).await {
+                                    eprintln!("Failed to write error response for request {request_id}: {e}");
+                                }
+                            }
                         }
-                    }
+                    });
                 }
                 FrameType::StreamItem | FrameType::StreamEnd | FrameType::StreamError => {
                     // Client-side streaming frames - would need stream handler registration
