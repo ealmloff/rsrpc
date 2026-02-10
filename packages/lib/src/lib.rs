@@ -487,13 +487,13 @@ impl<T: ?Sized + 'static> Client<T> {
     }
 
     /// Start a streaming call. Returns a stream of responses.
-    /// Reconnect is attempted once if the initial send fails.
+    /// Reconnect is attempted up to three times if the initial send fails.
     pub async fn call_stream<Req: Serialize + Sync, Item: DeserializeOwned + Send + 'static>(
         &self,
         method_id: u16,
         request: &Req,
     ) -> Result<RpcStream<Item>> {
-        for attempt in 0..2u8 {
+        for attempt in 0.. {
             let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
             let payload = postcard::to_allocvec(request)?;
 
@@ -548,7 +548,7 @@ impl<T: ?Sized + 'static> Client<T> {
 
             if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
                 self.inner.pending.lock().await.remove(&request_id);
-                if attempt == 0 {
+                if attempt < 3 {
                     eprintln!("RPC stream write failed ({e}), reconnecting...");
                     if self.reconnect().await.is_ok() {
                         continue;
