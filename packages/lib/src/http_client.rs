@@ -90,15 +90,22 @@ impl<T: ?Sized + 'static> HttpClient<T> {
             request = request.json(body);
         }
 
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|e| {
+            eprintln!("HTTP request failed: {method} {url}: {e}");
+            e
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            eprintln!("HTTP error: {method} {url} returned {status}: {text}");
             anyhow::bail!("HTTP {} {}: {}", status.as_u16(), status.as_str(), text);
         }
 
-        let result: R = response.json().await?;
+        let result: R = response.json().await.map_err(|e| {
+            eprintln!("HTTP response parse failed: {method} {url}: {e}");
+            e
+        })?;
         Ok(result)
     }
 }

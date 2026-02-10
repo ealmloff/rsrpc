@@ -312,7 +312,10 @@ impl<T: ?Sized> Clone for Client<T> {
 impl<T: ?Sized + 'static> Client<T> {
     /// Connect to a remote RPC server over TCP.
     pub async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(addr).await.map_err(|e| {
+            eprintln!("Failed to connect to {addr}: {e}");
+            e
+        })?;
         configure_keepalive(&stream)?;
         let (reader, writer) = tokio::io::split(stream);
 
@@ -349,7 +352,12 @@ impl<T: ?Sized + 'static> Client<T> {
     /// Replaces the writer and reader, and clears pending requests
     /// (their oneshot senders are dropped, yielding "Request cancelled").
     async fn reconnect(&self) -> Result<()> {
-        let stream = TcpStream::connect(&self.inner.addr).await?;
+        let addr = &self.inner.addr;
+        eprintln!("Attempting reconnect to {addr}...");
+        let stream = TcpStream::connect(addr).await.map_err(|e| {
+            eprintln!("Reconnect to {addr} failed: {e}");
+            e
+        })?;
         configure_keepalive(&stream)?;
         let (reader, writer) = tokio::io::split(stream);
 
@@ -358,6 +366,7 @@ impl<T: ?Sized + 'static> Client<T> {
         // Old ReaderHandle drops here, aborting the old reader task
         *self.inner.reader_handle.lock().await = Self::start_reader(&self.inner, reader);
 
+        eprintln!("Reconnected to {addr}");
         Ok(())
     }
 
@@ -368,20 +377,24 @@ impl<T: ?Sized + 'static> Client<T> {
         loop {
             // Read header (15 bytes with frame type)
             let mut header = [0u8; STREAM_HEADER_SIZE];
-            if reader.read_exact(&mut header).await.is_err() {
-                break; // Connection closed
+            if let Err(e) = reader.read_exact(&mut header).await {
+                eprintln!("Client connection closed (read error: {e})");
+                break;
             }
 
             let Some((frame_type, _method_id, request_id, payload_len)) =
                 decode_stream_header(&header)
             else {
-                eprintln!("Invalid frame type received");
+                eprintln!("Invalid frame type received (header: {header:?})");
                 continue;
             };
 
             // Read payload
             let mut payload = vec![0u8; payload_len as usize];
-            reader.read_exact(&mut payload).await?;
+            if let Err(e) = reader.read_exact(&mut payload).await {
+                eprintln!("Client failed to read payload ({payload_len} bytes): {e}");
+                return Err(e.into());
+            }
             let payload = Bytes::from(payload);
 
             // Dispatch based on request type
@@ -461,6 +474,7 @@ impl<T: ?Sized + 'static> Client<T> {
                     if self.reconnect().await.is_ok() {
                         continue;
                     }
+                    eprintln!("RPC call failed: reconnect unsuccessful after write error");
                 }
                 return Err(e.into());
             }
@@ -478,6 +492,7 @@ impl<T: ?Sized + 'static> Client<T> {
                         if self.reconnect().await.is_ok() {
                             continue;
                         }
+                        eprintln!("RPC call failed: reconnect unsuccessful after reader death");
                     }
                     return Err(anyhow!("Request cancelled - connection lost"));
                 }
@@ -549,10 +564,13 @@ impl<T: ?Sized + 'static> Client<T> {
             if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
                 self.inner.pending.lock().await.remove(&request_id);
                 if attempt < 3 {
-                    eprintln!("RPC stream write failed ({e}), reconnecting...");
+                    eprintln!("RPC stream write failed ({e}), reconnecting (attempt {attempt})...");
                     if self.reconnect().await.is_ok() {
                         continue;
                     }
+                    eprintln!("RPC stream call failed: reconnect unsuccessful on attempt {attempt}");
+                } else {
+                    eprintln!("RPC stream call failed after {attempt} attempts: {e}");
                 }
                 return Err(e.into());
             }
@@ -615,26 +633,31 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         service: Arc<T>,
         dispatch: DispatchFn<T>,
     ) -> Result<()> {
+        let peer = stream.peer_addr().map(|p| p.to_string()).unwrap_or_else(|_| "unknown".into());
         let (mut reader, writer) = tokio::io::split(stream);
         let writer = Arc::new(Mutex::new(writer));
 
         loop {
             // Read header (15 bytes with frame type)
             let mut header = [0u8; STREAM_HEADER_SIZE];
-            if reader.read_exact(&mut header).await.is_err() {
-                break; // Connection closed
+            if let Err(e) = reader.read_exact(&mut header).await {
+                eprintln!("Connection from {peer} closed (read error: {e})");
+                break;
             }
 
             let Some((frame_type, method_id, request_id, payload_len)) =
                 decode_stream_header(&header)
             else {
-                eprintln!("Invalid frame type received");
+                eprintln!("Invalid frame type received from {peer} (header: {header:?})");
                 continue;
             };
 
             // Read payload
             let mut payload = vec![0u8; payload_len as usize];
-            reader.read_exact(&mut payload).await?;
+            if let Err(e) = reader.read_exact(&mut payload).await {
+                eprintln!("Failed to read payload from {peer} ({payload_len} bytes): {e}");
+                return Err(e.into());
+            }
 
             match frame_type {
                 FrameType::Request => {
@@ -689,13 +712,13 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                             message.extend_from_slice(&header);
                                             message.extend_from_slice(&item_bytes);
 
-                                            if writer
+                                            if let Err(e) = writer
                                                 .lock()
                                                 .await
                                                 .write_all(&message)
                                                 .await
-                                                .is_err()
                                             {
+                                                eprintln!("Server stream write failed for request {request_id}: {e}");
                                                 break;
                                             }
                                         }
