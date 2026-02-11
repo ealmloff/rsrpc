@@ -329,6 +329,7 @@ impl<T: ?Sized + 'static> Client<T> {
         let inner_clone = Arc::clone(inner);
         ReaderHandle(tokio::spawn(async move {
             if let Err(e) = Self::read_responses(inner_clone, reader).await {
+                // Only log if it's not a cancellation (which happens on clean shutdown)
                 if !e.to_string().contains("canceled") {
                     warn!("Client reader error: {e}");
                 }
@@ -382,7 +383,7 @@ impl<T: ?Sized + 'static> Client<T> {
             // Read header (15 bytes with frame type)
             let mut header = [0u8; STREAM_HEADER_SIZE];
             if reader.read_exact(&mut header).await.is_err() {
-                break;
+                break; // Connection closed
             }
 
             let Some((frame_type, _method_id, request_id, payload_len)) =
@@ -459,6 +460,7 @@ impl<T: ?Sized + 'static> Client<T> {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         let payload = postcard::to_allocvec(request)?;
 
+        // Register pending request
         let (tx, rx) = oneshot::channel();
         self.inner
             .pending
@@ -466,6 +468,7 @@ impl<T: ?Sized + 'static> Client<T> {
             .await
             .insert(request_id, PendingRequest::Unary(tx));
 
+        // Build and send message with frame type
         let header = encode_stream_header(
             FrameType::Request,
             method_id,
@@ -481,6 +484,7 @@ impl<T: ?Sized + 'static> Client<T> {
             return Err(e.into());
         }
 
+        // Wait for response
         let response_payload = rx
             .await
             .map_err(|_| anyhow!("Request cancelled - connection lost"))?;
@@ -507,15 +511,18 @@ impl<T: ?Sized + 'static> Client<T> {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         let payload = postcard::to_allocvec(request)?;
 
+        // Create channels for stream
         let (frame_tx, mut frame_rx) = mpsc::channel::<StreamFrame>(32);
         let (item_tx, item_rx) = mpsc::channel::<Result<Item, String>>(32);
 
+        // Register pending stream
         self.inner
             .pending
             .lock()
             .await
             .insert(request_id, PendingRequest::Stream(frame_tx));
 
+        // Spawn task to convert frames to items
         tokio::spawn(async move {
             while let Some(frame) = frame_rx.recv().await {
                 match frame.frame_type {
@@ -544,6 +551,7 @@ impl<T: ?Sized + 'static> Client<T> {
             }
         });
 
+        // Send request
         let header = encode_stream_header(
             FrameType::Request,
             method_id,
@@ -621,7 +629,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
             // Read header (15 bytes with frame type)
             let mut header = [0u8; STREAM_HEADER_SIZE];
             if reader.read_exact(&mut header).await.is_err() {
-                break;
+                break; // Connection closed
             }
 
             let Some((frame_type, method_id, request_id, payload_len)) =
@@ -672,6 +680,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
 
                                 loop {
                                     let item = poll_fn(|cx| {
+                                        // SAFETY: The stream is boxed and we never move it
                                         let pinned = unsafe { Pin::new_unchecked(&mut *stream) };
                                         pinned.poll_next_bytes(cx)
                                     })
@@ -700,6 +709,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                             }
                                         }
                                         Some(Err(e)) => {
+                                            // Send error and end stream
                                             let error_bytes =
                                                 postcard::to_allocvec(&e).unwrap_or_default();
                                             let header = encode_stream_header(
@@ -719,6 +729,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                             break;
                                         }
                                         None => {
+                                            // Stream ended - send StreamEnd
                                             let header = encode_stream_header(
                                                 FrameType::StreamEnd,
                                                 method_id,
@@ -758,7 +769,9 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                         }
                     });
                 }
-                FrameType::StreamItem | FrameType::StreamEnd | FrameType::StreamError => {}
+                FrameType::StreamItem | FrameType::StreamEnd | FrameType::StreamError => {
+                    // Client-side streaming frames - not yet supported
+                }
                 FrameType::Response => {
                     // Server shouldn't receive Response frames
                     warn!("Server received unexpected Response frame");
