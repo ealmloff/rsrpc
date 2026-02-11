@@ -359,12 +359,13 @@ impl<T: ?Sized + 'static> Client<T> {
         F: Fn() -> Fut,
         Fut: Future<Output = Result<R>>,
     {
+        const MAX_ATTEMPTS: usize = 3;
         let mut attempts = 0;
         loop {
             self.reconnect().await?;
             match f().await {
                 Ok(val) => break Ok(val),
-                Err(e) if attempts < 3 => {
+                Err(e) if attempts < MAX_ATTEMPTS => {
                     warn!("Call failed: {e}, retrying...");
                     attempts += 1;
                 }
