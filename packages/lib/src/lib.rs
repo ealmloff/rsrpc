@@ -593,10 +593,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         info!("Server listening on {addr}");
 
         loop {
-            let (stream, peer) = listener.accept().await?;
-            if let Err(e) = configure_keepalive(&stream) {
-                warn!("Failed to set keepalive for {peer}: {e}");
-            }
+            let (stream, _peer) = listener.accept().await?;
             let service = Arc::clone(&self.service);
             let dispatch = self.dispatch;
 
