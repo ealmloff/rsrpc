@@ -108,6 +108,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{info, warn};
 
 /// Configure TCP keepalive on a tokio TcpStream.
 /// Sends a probe every 15s after 15s of idle, and considers the connection dead
@@ -312,10 +313,7 @@ impl<T: ?Sized> Clone for Client<T> {
 impl<T: ?Sized + 'static> Client<T> {
     /// Connect to a remote RPC server over TCP.
     pub async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            eprintln!("Failed to connect to {addr}: {e}");
-            e
-        })?;
+        let stream = TcpStream::connect(addr).await?;
         configure_keepalive(&stream)?;
         let (reader, writer) = tokio::io::split(stream);
 
@@ -345,7 +343,7 @@ impl<T: ?Sized + 'static> Client<T> {
         ReaderHandle(tokio::spawn(async move {
             if let Err(e) = Self::read_responses(inner_clone, reader).await {
                 if !e.to_string().contains("canceled") {
-                    eprintln!("Client reader error: {e}");
+                    warn!("Client reader error: {e}");
                 }
             }
         }))
@@ -356,11 +354,7 @@ impl<T: ?Sized + 'static> Client<T> {
     /// (their oneshot senders are dropped, yielding "Request cancelled").
     async fn reconnect(&self) -> Result<()> {
         let addr = &self.inner.addr;
-        eprintln!("Attempting reconnect to {addr}...");
-        let stream = TcpStream::connect(addr).await.map_err(|e| {
-            eprintln!("Reconnect to {addr} failed: {e}");
-            e
-        })?;
+        let stream = TcpStream::connect(addr).await?;
         configure_keepalive(&stream)?;
         let (reader, writer) = tokio::io::split(stream);
 
@@ -369,7 +363,7 @@ impl<T: ?Sized + 'static> Client<T> {
         // Old ReaderHandle drops here, aborting the old reader task
         *self.inner.reader_handle.lock().await = Self::start_reader(&self.inner, reader);
 
-        eprintln!("Reconnected to {addr}");
+        info!("Reconnected to {addr}");
         Ok(())
     }
 
@@ -380,22 +374,20 @@ impl<T: ?Sized + 'static> Client<T> {
         loop {
             // Read header (15 bytes with frame type)
             let mut header = [0u8; STREAM_HEADER_SIZE];
-            if let Err(e) = reader.read_exact(&mut header).await {
-                eprintln!("Client connection closed (read error: {e})");
+            if reader.read_exact(&mut header).await.is_err() {
                 break;
             }
 
             let Some((frame_type, _method_id, request_id, payload_len)) =
                 decode_stream_header(&header)
             else {
-                eprintln!("Invalid frame type received (header: {header:?})");
+                warn!("Invalid frame received");
                 continue;
             };
 
             // Read payload
             let mut payload = vec![0u8; payload_len as usize];
             if let Err(e) = reader.read_exact(&mut payload).await {
-                eprintln!("Client failed to read payload ({payload_len} bytes): {e}");
                 return Err(e.into());
             }
             let payload = Bytes::from(payload);
@@ -434,7 +426,7 @@ impl<T: ?Sized + 'static> Client<T> {
                 }
                 FrameType::Request => {
                     // Client shouldn't receive Request frames
-                    eprintln!("Client received unexpected Request frame");
+                    warn!("Client received unexpected Request frame");
                 }
             }
         }
@@ -473,11 +465,10 @@ impl<T: ?Sized + 'static> Client<T> {
             if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
                 self.inner.pending.lock().await.remove(&request_id);
                 if attempt == 0 {
-                    eprintln!("RPC write failed ({e}), reconnecting...");
+                    warn!("RPC write failed ({e}), reconnecting...");
                     if self.reconnect().await.is_ok() {
                         continue;
                     }
-                    eprintln!("RPC call failed: reconnect unsuccessful after write error");
                 }
                 return Err(e.into());
             }
@@ -490,11 +481,10 @@ impl<T: ?Sized + 'static> Client<T> {
                 Err(_) => {
                     // Reader died (connection lost) — oneshot sender was dropped
                     if attempt == 0 {
-                        eprintln!("RPC response lost (reader died), reconnecting...");
+                        warn!("RPC response lost (reader died), reconnecting...");
                         if self.reconnect().await.is_ok() {
                             continue;
                         }
-                        eprintln!("RPC call failed: reconnect unsuccessful after reader death");
                     }
                     return Err(anyhow!("Request cancelled - connection lost"));
                 }
@@ -566,15 +556,10 @@ impl<T: ?Sized + 'static> Client<T> {
             if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
                 self.inner.pending.lock().await.remove(&request_id);
                 if attempt < 3 {
-                    eprintln!("RPC stream write failed ({e}), reconnecting (attempt {attempt})...");
+                    warn!("RPC stream write failed ({e}), reconnecting...");
                     if self.reconnect().await.is_ok() {
                         continue;
                     }
-                    eprintln!(
-                        "RPC stream call failed: reconnect unsuccessful on attempt {attempt}"
-                    );
-                } else {
-                    eprintln!("RPC stream call failed after {attempt} attempts: {e}");
                 }
                 return Err(e.into());
             }
@@ -612,21 +597,19 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
     /// Listen for incoming connections on the given address.
     pub async fn listen(self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
-        println!("Server listening on {addr}");
+        info!("Server listening on {addr}");
 
         loop {
             let (stream, peer) = listener.accept().await?;
             if let Err(e) = configure_keepalive(&stream) {
-                eprintln!("Failed to set keepalive for {peer}: {e}");
+                warn!("Failed to set keepalive for {peer}: {e}");
             }
-            println!("New connection from {peer}");
-
             let service = Arc::clone(&self.service);
             let dispatch = self.dispatch;
 
             tokio::spawn(async move {
                 if let Err(e) = Self::handle_connection(stream, service, dispatch).await {
-                    eprintln!("Connection error: {e}");
+                    warn!("Connection error: {e}");
                 }
             });
         }
@@ -647,22 +630,20 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         loop {
             // Read header (15 bytes with frame type)
             let mut header = [0u8; STREAM_HEADER_SIZE];
-            if let Err(e) = reader.read_exact(&mut header).await {
-                eprintln!("Connection from {peer} closed (read error: {e})");
+            if reader.read_exact(&mut header).await.is_err() {
                 break;
             }
 
             let Some((frame_type, method_id, request_id, payload_len)) =
                 decode_stream_header(&header)
             else {
-                eprintln!("Invalid frame type received from {peer} (header: {header:?})");
+                warn!("Invalid frame received from {peer}");
                 continue;
             };
 
             // Read payload
             let mut payload = vec![0u8; payload_len as usize];
             if let Err(e) = reader.read_exact(&mut payload).await {
-                eprintln!("Failed to read payload from {peer} ({payload_len} bytes): {e}");
                 return Err(e.into());
             }
 
@@ -692,9 +673,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                 response.extend_from_slice(&response_payload);
 
                                 if let Err(e) = writer.lock().await.write_all(&response).await {
-                                    eprintln!(
-                                        "Failed to write response for request {request_id}: {e}"
-                                    );
+                                    warn!("Failed to write response for request {request_id}: {e}");
                                 }
                             }
                             DispatchResult::Stream(mut stream) => {
@@ -726,7 +705,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                             if let Err(e) =
                                                 writer.lock().await.write_all(&message).await
                                             {
-                                                eprintln!("Server stream write failed for request {request_id}: {e}");
+                                                warn!("Server stream write failed for request {request_id}: {e}");
                                                 break;
                                             }
                                         }
@@ -783,22 +762,16 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                                 response.extend_from_slice(&response_payload);
 
                                 if let Err(e) = writer.lock().await.write_all(&response).await {
-                                    eprintln!("Failed to write error response for request {request_id}: {e}");
+                                    warn!("Failed to write error response for request {request_id}: {e}");
                                 }
                             }
                         }
                     });
                 }
-                FrameType::StreamItem | FrameType::StreamEnd | FrameType::StreamError => {
-                    // Client-side streaming frames - would need stream handler registration
-                    eprintln!(
-                        "Server received stream frame (not yet routed): {:?}",
-                        frame_type
-                    );
-                }
+                FrameType::StreamItem | FrameType::StreamEnd | FrameType::StreamError => {}
                 FrameType::Response => {
                     // Server shouldn't receive Response frames
-                    eprintln!("Server received unexpected Response frame");
+                    warn!("Server received unexpected Response frame");
                 }
             }
         }
