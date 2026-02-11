@@ -339,9 +339,21 @@ impl<T: ?Sized + 'static> Client<T> {
     }
 
     /// Re-establish the TCP connection to the server.
-    /// Replaces the writer and reader, and clears pending requests
-    /// (their oneshot senders are dropped, yielding "Request cancelled").
+    ///
+    /// Uses the `reader_handle` lock to serialize reconnections. If the reader
+    /// task is still running (i.e. another task already reconnected), this is a
+    /// no-op. Pending streams receive an explicit error rather than silently
+    /// ending.
     async fn reconnect(&self) -> Result<()> {
+        // Lock reader_handle first — serializes concurrent reconnect attempts.
+        let mut reader_guard = self.inner.reader_handle.lock().await;
+
+        // If the reader is still running, another task already reconnected.
+        if !reader_guard.0.is_finished() {
+            debug!("Reconnect already performed by another task");
+            return Ok(());
+        }
+
         let addr = &self.inner.addr;
         let stream = TcpStream::connect(addr).await?;
         let (reader, writer) = tokio::io::split(stream);
@@ -349,7 +361,7 @@ impl<T: ?Sized + 'static> Client<T> {
         *self.inner.writer.lock().await = writer;
         self.inner.pending.lock().await.clear();
         // Old ReaderHandle drops here, aborting the old reader task
-        *self.inner.reader_handle.lock().await = Self::start_reader(&self.inner, reader);
+        *reader_guard = Self::start_reader(&self.inner, reader);
 
         debug!("Reconnected to {addr}");
         Ok(())
