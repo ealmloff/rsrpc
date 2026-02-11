@@ -108,7 +108,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Re-export the service macro
 pub use rsrpc_macro::service;
@@ -313,6 +313,7 @@ impl<T: ?Sized + 'static> Client<T> {
             reader_handle: Mutex::new(ReaderHandle(tokio::spawn(async {}))),
         });
 
+        // Spawn reader task to handle responses
         *inner.reader_handle.lock().await = Self::start_reader(&inner, reader);
 
         Ok(Self {
@@ -350,7 +351,7 @@ impl<T: ?Sized + 'static> Client<T> {
         // Old ReaderHandle drops here, aborting the old reader task
         *self.inner.reader_handle.lock().await = Self::start_reader(&self.inner, reader);
 
-        info!("Reconnected to {addr}");
+        debug!("Reconnected to {addr}");
         Ok(())
     }
 
@@ -601,7 +602,9 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         info!("Server listening on {addr}");
 
         loop {
-            let (stream, _peer) = listener.accept().await?;
+            let (stream, peer) = listener.accept().await?;
+            info!("New connection from {peer}");
+
             let service = Arc::clone(&self.service);
             let dispatch = self.dispatch;
 
@@ -770,7 +773,11 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
                     });
                 }
                 FrameType::StreamItem | FrameType::StreamEnd | FrameType::StreamError => {
-                    // Client-side streaming frames - not yet supported
+                    // Client-side streaming frames - would need stream handler registration
+                    warn!(
+                        "Server received stream frame (not yet routed): {:?}",
+                        frame_type
+                    );
                 }
                 FrameType::Response => {
                     // Server shouldn't receive Response frames
