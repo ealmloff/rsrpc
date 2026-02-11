@@ -355,23 +355,31 @@ impl<T: ?Sized + 'static> Client<T> {
         Ok(())
     }
 
-    /// Reconnect and retry up to 3 times on failure.
+    /// Try the call first on the existing connection; on failure, reconnect and
+    /// retry up to MAX_ATTEMPTS times.
     async fn with_retry<R, F, Fut>(&self, f: F) -> Result<R>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<R>>,
     {
         const MAX_ATTEMPTS: usize = 3;
-        let mut attempts = 0;
-        loop {
-            self.reconnect().await?;
-            match f().await {
-                Ok(val) => break Ok(val),
-                Err(e) if attempts < MAX_ATTEMPTS => {
-                    warn!("Call failed: {e}, retrying...");
-                    attempts += 1;
+        match f().await {
+            Ok(val) => Ok(val),
+            Err(first_err) => {
+                warn!("Call failed: {first_err}, reconnecting...");
+                for attempt in 0..MAX_ATTEMPTS {
+                    if let Err(e) = self.reconnect().await {
+                        warn!("Reconnect failed (attempt {}): {e}", attempt + 1);
+                        continue;
+                    }
+                    match f().await {
+                        Ok(val) => return Ok(val),
+                        Err(e) => {
+                            warn!("Retry {} failed: {e}", attempt + 1);
+                        }
+                    }
                 }
-                Err(e) => break Err(e),
+                Err(first_err)
             }
         }
     }
