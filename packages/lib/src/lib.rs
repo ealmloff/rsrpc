@@ -110,18 +110,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{info, warn};
 
-/// Configure TCP keepalive on a tokio TcpStream.
-/// Sends a probe every 15s after 15s of idle, and considers the connection dead
-/// after a few failed probes (OS-dependent retries).
-fn configure_keepalive(stream: &TcpStream) -> Result<()> {
-    let sock = socket2::SockRef::from(stream);
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(std::time::Duration::from_secs(15))
-        .with_interval(std::time::Duration::from_secs(15));
-    sock.set_tcp_keepalive(&keepalive)?;
-    Ok(())
-}
-
 /// Re-export the service macro
 pub use rsrpc_macro::service;
 
@@ -314,7 +302,6 @@ impl<T: ?Sized + 'static> Client<T> {
     /// Connect to a remote RPC server over TCP.
     pub async fn connect(addr: &str) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
-        configure_keepalive(&stream)?;
         let (reader, writer) = tokio::io::split(stream);
 
         // Use a placeholder reader handle; replaced immediately below once Arc exists.
@@ -355,7 +342,6 @@ impl<T: ?Sized + 'static> Client<T> {
     async fn reconnect(&self) -> Result<()> {
         let addr = &self.inner.addr;
         let stream = TcpStream::connect(addr).await?;
-        configure_keepalive(&stream)?;
         let (reader, writer) = tokio::io::split(stream);
 
         *self.inner.writer.lock().await = writer;
@@ -600,10 +586,7 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         info!("Server listening on {addr}");
 
         loop {
-            let (stream, peer) = listener.accept().await?;
-            if let Err(e) = configure_keepalive(&stream) {
-                warn!("Failed to set keepalive for {peer}: {e}");
-            }
+            let (stream, _peer) = listener.accept().await?;
             let service = Arc::clone(&self.service);
             let dispatch = self.dispatch;
 
