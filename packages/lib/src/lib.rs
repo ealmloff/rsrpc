@@ -353,6 +353,26 @@ impl<T: ?Sized + 'static> Client<T> {
         Ok(())
     }
 
+    /// Reconnect and retry up to 3 times on failure.
+    async fn with_retry<R, F, Fut>(&self, f: F) -> Result<R>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<R>>,
+    {
+        let mut attempts = 0;
+        loop {
+            self.reconnect().await?;
+            match f().await {
+                Ok(val) => break Ok(val),
+                Err(e) if attempts < 3 => {
+                    warn!("Call failed: {e}, retrying...");
+                    attempts += 1;
+                }
+                Err(e) => break Err(e),
+            }
+        }
+    }
+
     async fn read_responses(
         inner: Arc<ClientInner>,
         mut reader: tokio::io::ReadHalf<TcpStream>,
@@ -421,138 +441,124 @@ impl<T: ?Sized + 'static> Client<T> {
 
     /// Low-level call method used by generated trait impls.
     /// Sends a request and waits for a unary response.
-    /// On connection failure, reconnects and retries once.
+    /// On connection failure, reconnects and retries up to 3 times.
     pub async fn call<Req: Serialize + Sync, Resp: DeserializeOwned>(
         &self,
         method_id: u16,
         request: &Req,
     ) -> Result<Resp> {
-        for attempt in 0..2u8 {
-            let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
-            let payload = postcard::to_allocvec(request)?;
+        self.with_retry(|| self.try_call(method_id, request)).await
+    }
 
-            let (tx, rx) = oneshot::channel();
-            self.inner
-                .pending
-                .lock()
-                .await
-                .insert(request_id, PendingRequest::Unary(tx));
+    async fn try_call<Req: Serialize + Sync, Resp: DeserializeOwned>(
+        &self,
+        method_id: u16,
+        request: &Req,
+    ) -> Result<Resp> {
+        let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let payload = postcard::to_allocvec(request)?;
 
-            let header = encode_stream_header(
-                FrameType::Request,
-                method_id,
-                request_id,
-                payload.len() as u32,
-            );
-            let mut message = Vec::with_capacity(STREAM_HEADER_SIZE + payload.len());
-            message.extend_from_slice(&header);
-            message.extend_from_slice(&payload);
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .pending
+            .lock()
+            .await
+            .insert(request_id, PendingRequest::Unary(tx));
 
-            if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
-                self.inner.pending.lock().await.remove(&request_id);
-                if attempt == 0 {
-                    warn!("RPC write failed ({e}), reconnecting...");
-                    if self.reconnect().await.is_ok() {
-                        continue;
-                    }
-                }
-                return Err(e.into());
-            }
+        let header = encode_stream_header(
+            FrameType::Request,
+            method_id,
+            request_id,
+            payload.len() as u32,
+        );
+        let mut message = Vec::with_capacity(STREAM_HEADER_SIZE + payload.len());
+        message.extend_from_slice(&header);
+        message.extend_from_slice(&payload);
 
-            match rx.await {
-                Ok(response_payload) => {
-                    let response: Result<Resp, String> = postcard::from_bytes(&response_payload)?;
-                    return response.map_err(|e| anyhow!("{e}"));
-                }
-                Err(_) => {
-                    // Reader died (connection lost) — oneshot sender was dropped
-                    if attempt == 0 {
-                        warn!("RPC response lost (reader died), reconnecting...");
-                        if self.reconnect().await.is_ok() {
-                            continue;
-                        }
-                    }
-                    return Err(anyhow!("Request cancelled - connection lost"));
-                }
-            }
+        if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
+            self.inner.pending.lock().await.remove(&request_id);
+            return Err(e.into());
         }
-        unreachable!()
+
+        let response_payload = rx
+            .await
+            .map_err(|_| anyhow!("Request cancelled - connection lost"))?;
+        let response: Result<Resp, String> = postcard::from_bytes(&response_payload)?;
+        response.map_err(|e| anyhow!("{e}"))
     }
 
     /// Start a streaming call. Returns a stream of responses.
-    /// Reconnect is attempted up to three times if the initial send fails.
+    /// On connection failure, reconnects and retries up to 3 times.
     pub async fn call_stream<Req: Serialize + Sync, Item: DeserializeOwned + Send + 'static>(
         &self,
         method_id: u16,
         request: &Req,
     ) -> Result<RpcStream<Item>> {
-        for attempt in 0.. {
-            let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
-            let payload = postcard::to_allocvec(request)?;
+        self.with_retry(|| self.try_call_stream(method_id, request))
+            .await
+    }
 
-            let (frame_tx, mut frame_rx) = mpsc::channel::<StreamFrame>(32);
-            let (item_tx, item_rx) = mpsc::channel::<Result<Item, String>>(32);
+    async fn try_call_stream<Req: Serialize + Sync, Item: DeserializeOwned + Send + 'static>(
+        &self,
+        method_id: u16,
+        request: &Req,
+    ) -> Result<RpcStream<Item>> {
+        let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let payload = postcard::to_allocvec(request)?;
 
-            self.inner
-                .pending
-                .lock()
-                .await
-                .insert(request_id, PendingRequest::Stream(frame_tx));
+        let (frame_tx, mut frame_rx) = mpsc::channel::<StreamFrame>(32);
+        let (item_tx, item_rx) = mpsc::channel::<Result<Item, String>>(32);
 
-            tokio::spawn(async move {
-                while let Some(frame) = frame_rx.recv().await {
-                    match frame.frame_type {
-                        FrameType::StreamItem => {
-                            match postcard::from_bytes::<Item>(&frame.payload) {
-                                Ok(item) => {
-                                    if item_tx.send(Ok(item)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = item_tx.send(Err(e.to_string())).await;
-                                    break;
-                                }
+        self.inner
+            .pending
+            .lock()
+            .await
+            .insert(request_id, PendingRequest::Stream(frame_tx));
+
+        tokio::spawn(async move {
+            while let Some(frame) = frame_rx.recv().await {
+                match frame.frame_type {
+                    FrameType::StreamItem => match postcard::from_bytes::<Item>(&frame.payload) {
+                        Ok(item) => {
+                            if item_tx.send(Ok(item)).await.is_err() {
+                                break;
                             }
                         }
-                        FrameType::StreamEnd => {
+                        Err(e) => {
+                            let _ = item_tx.send(Err(e.to_string())).await;
                             break;
                         }
-                        FrameType::StreamError => {
-                            let error: String = postcard::from_bytes(&frame.payload)
-                                .unwrap_or_else(|_| "Unknown stream error".to_string());
-                            let _ = item_tx.send(Err(error)).await;
-                            break;
-                        }
-                        _ => {}
+                    },
+                    FrameType::StreamEnd => {
+                        break;
                     }
-                }
-            });
-
-            let header = encode_stream_header(
-                FrameType::Request,
-                method_id,
-                request_id,
-                payload.len() as u32,
-            );
-            let mut message = Vec::with_capacity(STREAM_HEADER_SIZE + payload.len());
-            message.extend_from_slice(&header);
-            message.extend_from_slice(&payload);
-
-            if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
-                self.inner.pending.lock().await.remove(&request_id);
-                if attempt < 3 {
-                    warn!("RPC stream write failed ({e}), reconnecting...");
-                    if self.reconnect().await.is_ok() {
-                        continue;
+                    FrameType::StreamError => {
+                        let error: String = postcard::from_bytes(&frame.payload)
+                            .unwrap_or_else(|_| "Unknown stream error".to_string());
+                        let _ = item_tx.send(Err(error)).await;
+                        break;
                     }
+                    _ => {}
                 }
-                return Err(e.into());
             }
+        });
 
-            return Ok(RpcStream::new(item_rx));
+        let header = encode_stream_header(
+            FrameType::Request,
+            method_id,
+            request_id,
+            payload.len() as u32,
+        );
+        let mut message = Vec::with_capacity(STREAM_HEADER_SIZE + payload.len());
+        message.extend_from_slice(&header);
+        message.extend_from_slice(&payload);
+
+        if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
+            self.inner.pending.lock().await.remove(&request_id);
+            return Err(e.into());
         }
-        unreachable!()
+
+        Ok(RpcStream::new(item_rx))
     }
 }
 
@@ -586,7 +592,10 @@ impl<T: ?Sized + Send + Sync + 'static> Server<T> {
         info!("Server listening on {addr}");
 
         loop {
-            let (stream, _peer) = listener.accept().await?;
+            let (stream, peer) = listener.accept().await?;
+            if let Err(e) = configure_keepalive(&stream) {
+                warn!("Failed to set keepalive for {peer}: {e}");
+            }
             let service = Arc::clone(&self.service);
             let dispatch = self.dispatch;
 
