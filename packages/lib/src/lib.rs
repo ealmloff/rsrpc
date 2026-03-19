@@ -261,10 +261,25 @@ impl Drop for ReaderHandle {
 /// The magic: `Client<dyn MyTrait>` implements `MyTrait`, so you can call
 /// `client.method(args)` directly.
 ///
-/// On connection loss, unary calls automatically reconnect and retry once.
+/// On transport loss, unary calls automatically reconnect and retry.
 pub struct Client<T: ?Sized> {
     inner: Arc<ClientInner>,
     _marker: PhantomData<T>,
+}
+
+enum CallFailure {
+    Retryable(anyhow::Error),
+    NonRetryable(anyhow::Error),
+}
+
+impl CallFailure {
+    fn retryable(err: impl Into<anyhow::Error>) -> Self {
+        Self::Retryable(err.into())
+    }
+
+    fn non_retryable(err: impl Into<anyhow::Error>) -> Self {
+        Self::NonRetryable(err.into())
+    }
 }
 
 /// Internal state for pending requests
@@ -372,12 +387,13 @@ impl<T: ?Sized + 'static> Client<T> {
     async fn with_retry<R, F, Fut>(&self, f: F) -> Result<R>
     where
         F: Fn() -> Fut,
-        Fut: Future<Output = Result<R>>,
+        Fut: Future<Output = std::result::Result<R, CallFailure>>,
     {
         const MAX_ATTEMPTS: usize = 3;
         match f().await {
             Ok(val) => Ok(val),
-            Err(first_err) => {
+            Err(CallFailure::NonRetryable(err)) => Err(err),
+            Err(CallFailure::Retryable(first_err)) => {
                 warn!("Call failed: {first_err}, reconnecting...");
                 for attempt in 0..MAX_ATTEMPTS {
                     if let Err(e) = self.reconnect().await {
@@ -386,8 +402,15 @@ impl<T: ?Sized + 'static> Client<T> {
                     }
                     match f().await {
                         Ok(val) => return Ok(val),
-                        Err(e) => {
+                        Err(CallFailure::Retryable(e)) => {
                             warn!("Retry {} failed: {e}", attempt + 1);
+                        }
+                        Err(CallFailure::NonRetryable(err)) => {
+                            warn!(
+                                "Retry {} failed with non-retryable error: {err}",
+                                attempt + 1
+                            );
+                            return Err(err);
                         }
                     }
                 }
@@ -464,7 +487,7 @@ impl<T: ?Sized + 'static> Client<T> {
 
     /// Low-level call method used by generated trait impls.
     /// Sends a request and waits for a unary response.
-    /// On connection failure, reconnects and retries up to 3 times.
+    /// Retries only transport failures; remote method errors return immediately.
     pub async fn call<Req: Serialize + Sync, Resp: DeserializeOwned>(
         &self,
         method_id: u16,
@@ -477,9 +500,9 @@ impl<T: ?Sized + 'static> Client<T> {
         &self,
         method_id: u16,
         request: &Req,
-    ) -> Result<Resp> {
+    ) -> std::result::Result<Resp, CallFailure> {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let payload = postcard::to_allocvec(request)?;
+        let payload = postcard::to_allocvec(request).map_err(CallFailure::non_retryable)?;
 
         // Register pending request
         let (tx, rx) = oneshot::channel();
@@ -502,19 +525,20 @@ impl<T: ?Sized + 'static> Client<T> {
 
         if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
             self.inner.pending.lock().await.remove(&request_id);
-            return Err(e.into());
+            return Err(CallFailure::retryable(e));
         }
 
         // Wait for response
         let response_payload = rx
             .await
-            .map_err(|_| anyhow!("Request cancelled - connection lost"))?;
-        let response: Result<Resp, String> = postcard::from_bytes(&response_payload)?;
-        response.map_err(|e| anyhow!("{e}"))
+            .map_err(|_| CallFailure::retryable(anyhow!("Request cancelled - connection lost")))?;
+        let response: Result<Resp, String> =
+            postcard::from_bytes(&response_payload).map_err(CallFailure::non_retryable)?;
+        response.map_err(|e| CallFailure::non_retryable(anyhow!("{e}")))
     }
 
     /// Start a streaming call. Returns a stream of responses.
-    /// On connection failure, reconnects and retries up to 3 times.
+    /// Retries only transport failures while establishing the stream.
     pub async fn call_stream<Req: Serialize + Sync, Item: DeserializeOwned + Send + 'static>(
         &self,
         method_id: u16,
@@ -528,9 +552,9 @@ impl<T: ?Sized + 'static> Client<T> {
         &self,
         method_id: u16,
         request: &Req,
-    ) -> Result<RpcStream<Item>> {
+    ) -> std::result::Result<RpcStream<Item>, CallFailure> {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let payload = postcard::to_allocvec(request)?;
+        let payload = postcard::to_allocvec(request).map_err(CallFailure::non_retryable)?;
 
         // Create channels for stream
         let (frame_tx, mut frame_rx) = mpsc::channel::<StreamFrame>(32);
@@ -585,7 +609,7 @@ impl<T: ?Sized + 'static> Client<T> {
 
         if let Err(e) = self.inner.writer.lock().await.write_all(&message).await {
             self.inner.pending.lock().await.remove(&request_id);
-            return Err(e.into());
+            return Err(CallFailure::retryable(e));
         }
 
         Ok(RpcStream::new(item_rx))
